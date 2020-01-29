@@ -1,0 +1,3 @@
+*.ptx
+cuda2go
+*.orig

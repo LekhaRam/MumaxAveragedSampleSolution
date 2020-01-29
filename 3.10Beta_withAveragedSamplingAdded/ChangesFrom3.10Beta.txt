@@ -1,0 +1,143 @@
+Date: 05-09-2019. 
+Changes: Added below funtions/declarations in the respective files listed to introduce a new function SaveAsSampled 
+which allows to save only sampled data (averaging over sampled volume) in user specified filename. This sampling helps to 
+reduce the file size of magnetization data and is relevant for large stucture simulations with small cell size restriction.
+Developer: Lekha Puthalath Nair
+
+engine/save.go:
+---------------
+DeclFunc("SaveAsSampled", SaveAsSampled, "Save sampled space-dependent with custom filename")
+
+func SaveAsSampled(q Quantity, fname string, x_sample int, ysample int, zsample int) {
+        if !strings.HasPrefix(fname, OD()) {
+                fname = OD() + fname // don't clean, turns http:// in http:/
+        }
+
+        if path.Ext(fname) == "" {
+                fname += ("." + StringFromOutputFormat[outputFormat])
+        }
+      buffer := ValueOf(q)
+      defer cuda.Recycle(buffer)
+      info := data.Meta{Time: Time, Name: NameOf(q), Unit: UnitOf(q), CellSize: MeshOf(q).CellSize()}
+      data := buffer.HostCopy() // must be copy (async io)
+      queOutput(func() { saveAs_syncSampled(fname, data, info, outputFormat, x_sample, ysample, zsample) })
+}
+
+
+ func saveAs_syncSampled(fname string, s *data.Slice, info data.Meta, format OutputFormat, xsample int, ysample int, zsample int) {
+         f, err := httpfs.Create(fname)
+         util.FatalErr(err)
+         defer f.Close()
+
+         switch format {
+         case OVF1_TEXT:
+                 oommf.WriteOVF1Sampled(f, s, info, "text", xsample, ysample, zsample)
+         //case OVF1_BINARY:
+         //        oommf.WriteOVF1(f, s, info, "binary 4")
+         case OVF2_TEXT:
+                 oommf.WriteOVF2Sampled(f, s, info, "text", xsample, ysample, zsample)
+         //case OVF2_BINARY:
+         //        oommf.WriteOVF2(f, s, info, "binary 4")
+         case DUMP:
+                 dump.Write(f, s, info)
+         default:
+                 panic("invalid output format-Only TXT format supported for Sampling for now")
+         }
+
+ }
+
+-------------------------------------
+oommf/ovf1.go:
+-------------------------------------
+
+func WriteOVF1Sampled(out io.Writer, q *data.Slice, meta data.Meta, dataformat string,xsample int,ysample int, zsample int) {
+        writeOVF1Header(out, q, meta)
+        writeOVF1DataSampled(out, q, dataformat, xsample, ysample, zsample)
+        hdr(out, "End", "Segment")
+}
+
+func writeOVF1DataSampled(out io.Writer, q *data.Slice, dataformat string,xsample int, ysample int, zsample int) {
+        canonicalFormat := ""
+        switch strings.ToLower(dataformat) {
+        case "text":
+                canonicalFormat = "Text"
+                hdr(out, "Begin", "Data "+canonicalFormat)
+                writeOVFTextSampled(out, q, xsample, ysample, zsample)
+        case "binary", "binary 4":
+                canonicalFormat = "Binary 4"
+                hdr(out, "Begin", "Data "+canonicalFormat)
+                writeOVF1Binary4(out, q)
+        default:
+                log.Fatalf("Illegal OVF data format: %v. Options are: Text, Binary 4", dataformat)
+        }
+        hdr(out, "End", "Data "+canonicalFormat)
+}
+
+-------------------------------------
+oommf/ovf2.go:
+-------------------------------------
+
+func WriteOVF2Sampled(out io.Writer, q *data.Slice, meta data.Meta, dataformat string, xsample int, ysample int, zsample int) {
+        writeOVF2Header(out, q, meta)
+        writeOVF2DataSampled(out, q, dataformat, xsample, ysample, zsample)
+        hdr(out, "End", "Segment")
+}
+
+func writeOVF2DataSampled(out io.Writer, q *data.Slice, dataformat string,xsample int, ysample int, zsample int) {
+        canonicalFormat := ""
+        switch strings.ToLower(dataformat) {
+        case "text":
+                canonicalFormat = "Text"
+                hdr(out, "Begin", "Data "+canonicalFormat)
+                writeOVFTextSampled(out, q, xsample, ysample, zsample)
+        case "binary", "binary 4":
+                canonicalFormat = "Binary 4"
+                hdr(out, "Begin", "Data "+canonicalFormat)
+                writeOVF2DataBinary4(out, q)
+        default:
+                log.Fatalf("Illegal OMF data format: %v. Options are: Text, Binary 4", dataformat)
+        }
+        hdr(out, "End", "Data "+canonicalFormat)
+}
+
+-------------------------------------
+oommf/oommf.go:
+-------------------------------------
+Added below:
+
+// write Sampled data block in text format, for OVF1
+func writeOVFTextSampled(out io.Writer, tens *data.Slice,xsample int, ysample int, zsample int) (err error) {
+        data := tens.Tensors()
+        gridsize := tens.Size()
+        ncomp := tens.NComp()
+      var sumSample float64
+      var avgSample float64
+
+        // Here we loop over X,Y,Z, not Z,Y,X, because
+        // internal in C-order == external in Fortran-order
+        for iz := 0; (iz < gridsize[Z]) && ((zsample+iz)<=gridsize[Z]); iz=iz+zsample {
+                for iy := 0; (iy < gridsize[Y]) && ((ysample+iy)<=gridsize[Y]) ; iy=iy+ysample {
+                        for ix := 0; (ix < gridsize[X]) && ((xsample+ix)<=gridsize[X]); ix=ix+xsample {
+                                for c := 0; c < ncomp; c++ {
+                                      // Averaging loop begins:
+                                      sumSample=0.0
+                                      avgSample=0.0
+                                      counter:=0
+                                      for az:=0; az < zsample; az++{
+                                              for ay:=0; ay < ysample; ay++ {
+                                                      for ax:=0; ax < xsample; ax++{
+                                                              sumSample=sumSample + float64(data[c][iz+az][iy+ay][ix+ax])
+                                                              counter++
+                                                      }
+                                              }
+                                      }
+                                      avgSample=sumSample/float64(counter)
+                                        _, err = fmt.Fprint(out, avgSample, " ")
+                                }
+                                _, err = fmt.Fprint(out, "\n")
+                        }
+                }
+        }
+        return
+}
+
